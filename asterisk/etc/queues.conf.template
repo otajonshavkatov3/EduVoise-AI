@@ -1,0 +1,31 @@
+;=============================================================================
+; queues.conf - ACD (automatic call distribution) queues for CallCenter
+; "Aqlli Shahar".
+;
+; Rendered by asterisk/scripts/entrypoint.sh. It carries no ${...} credentials,
+; so the envsubst whitelist leaves every line untouched; it is a template only so
+; the #include of the backend-generated per-tenant file is version-controlled
+; alongside pjsip.conf.template and extensions.conf.template.
+;
+; THE ACTUAL QUEUES come from the database, not from here. Each customer's queue
+; (<slug>-ops) and its members are generated from the operator_profiles table into
+; generated/queues-tenants.conf by apps/backend/src/lib/asterisk/tenant-config.ts
+; and reloaded over AMI (Reload app_queue.so) - exactly like pjsip-tenants.conf and
+; extensions-tenants.conf - so onboarding a customer needs no restart and no edit
+; on the host. The container writes a bootstrap copy from .env only when the file
+; is missing, so a fresh clone has a working queue before the backend has run.
+;=============================================================================
+
+[general]
+; Remember dynamic members across a restart.
+persistentmembers = yes
+; Connect waiting callers to free members in parallel rather than strictly serial.
+autofill = yes
+; A member in more than one queue counts their wrap-up time across all of them.
+shared_lastcall = yes
+; Record queue conversations with MixMonitor (joins the two legs into one file).
+monitor-type = MixMonitor
+
+; The per-tenant queues, generated from the tenants/operator_profiles tables.
+; Last, so [general] is defined before any queue references it.
+#include "generated/queues-tenants.conf"

@@ -1,0 +1,1 @@
+ALTER TABLE "calls" ADD COLUMN "answered_at" timestamp with time zone;

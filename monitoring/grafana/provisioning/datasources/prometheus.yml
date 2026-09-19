@@ -1,0 +1,50 @@
+# =============================================================================
+# Grafana datasource provisioning - Prometheus
+#
+# Mounted at /etc/grafana/provisioning/datasources/prometheus.yml. Grafana reads
+# this on every start, so the datasource exists before any dashboard loads and
+# nobody has to click through the UI after a redeploy.
+#
+# The `uid` is FIXED (not auto-generated) because dashboards/callcenter.json
+# references datasources by uid. Change it here and every panel in that
+# dashboard breaks.
+# =============================================================================
+apiVersion: 1
+
+# Removes a datasource that was provisioned earlier under a different name.
+# Harmless when it does not exist; keeps repeated deploys idempotent.
+deleteDatasources:
+  - name: Prometheus-old
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # Reached over the compose network. Grafana never talks to 127.0.0.1:9090 -
+    # that address only exists on the host, not inside the Grafana container.
+    url: http://prometheus:9090
+    orgId: 1
+    isDefault: true
+    # Allows edits to be re-applied from this file on restart. Set to false if
+    # you want the UI to be authoritative instead.
+    editable: false
+    jsonData:
+      # POST allows much longer PromQL than a GET query string, which the
+      # multi-series panels in callcenter.json need.
+      httpMethod: POST
+      # Must match prometheus.yml's scrape_interval, otherwise Grafana's
+      # $__rate_interval is computed from the wrong base and rate() over short
+      # ranges returns gaps.
+      timeInterval: 15s
+      # Pin the query API surface to what the deployed Prometheus supports.
+      prometheusType: Prometheus
+      prometheusVersion: 2.55.0
+      # Show the exemplar/trace link column only if tracing is added later.
+      exemplarTraceIdDestinations: []
+      # Fail a panel rather than hang the dashboard when Prometheus is slow.
+      timeout: 30
+      # Prometheus is only reachable inside the compose network, so no auth is
+      # configured. If you later expose it, add basicAuth here and put the
+      # password in secureJsonData.

@@ -1,0 +1,340 @@
+;=============================================================================
+; extensions.conf - dialplan for CallCenter "Aqlli Shahar"
+;
+; MULTI-TENANT. Every customer of this platform has their OWN five contexts, and
+; a call executing in one of them can reach nothing but that customer's own
+; endpoints. Extension numbers repeat across customers on purpose - "101" is an
+; operator code, and two customers will both have one - so the isolation lives in
+; the CONTEXT NAME and the PJSIP ENDPOINT NAME, never in the digits the customer
+; dials. A customer types 101 and reaches their own 101.
+;
+;   endpoint   avilab-101              (unique platform-wide)
+;   contexts   from-internal-avilab, from-external-avilab, ai-bridge-avilab,
+;              ai-transfer-avilab, click-to-call-avilab
+;   trunk      trunk-avilab
+;
+; WHERE THE PER-TENANT CONTEXTS ACTUALLY COME FROM. Not from this file: a tenant
+; is a database row, and adding one must not need a rebuild or a restart. The
+; backend renders asterisk/etc/generated/extensions-tenants.conf from the tenants
+; table and reloads pbx_config over AMI; that file is #include-d at the bottom and
+; contains nothing but one-line context declarations that INHERIT the `(!)`
+; templates below:
+;
+;     [from-internal-avilab](tenant-internal)
+;
+; So the dialplan logic exists exactly once, here, and a new customer costs five
+; lines of generated text.
+;
+; HOW A TEMPLATE KNOWS WHICH TENANT IT IS RUNNING FOR. From its own context name.
+; ${CONTEXT} is "from-internal-avilab", and "from-internal-" is 14 characters, so
+; ${CONTEXT:14} is the slug. Every template below spells out the length it strips,
+; because getting it wrong is how one customer's call dials another customer's
+; endpoint - which is why the generator, the resolver and these templates all
+; derive their names from ONE contract: lib/tenancy/asterisk-naming.ts.
+;
+; This file is rendered by asterisk/scripts/entrypoint.sh. The only substituted
+; name is ${ASTERISK_LEGACY_TENANT_SLUG}; every other ${...} is a dialplan
+; variable and is left alone by the envsubst whitelist.
+;
+; Call flow for an AI-answered call:
+;
+;   caller -> [from-internal-<slug>|from-external-<slug>]
+;                 -> Stasis(callcenter-ai,tenant=<slug>)
+;                                                |
+;                        backend ARI handler: resolves the tenant from that
+;                        argument, creates the CRM call row, matches/creates the
+;                        contact, answers the channel, sets AS_UUID (= calls.id)
+;                        and AS_HOST, then continueInDialplan -> [ai-bridge-<slug>]
+;                                                |
+;   [ai-bridge-<slug>] -> MixMonitor (recording, into the tenant's own directory)
+;                      -> AudioSocket -> backend TCP -> realtime model
+;
+; Using calls.id as the AudioSocket UUID is what lets the bridge correlate an
+; incoming TCP connection back to the CRM record with no extra lookup.
+;
+; Call flow for an AI-placed OUTBOUND campaign call:
+;
+;   backend placeOutboundCall() -> ARI POST /channels with `app` and NO
+;                                  `extension`, so the new channel enters
+;                                  Stasis(callcenter-ai) directly and never
+;                                  touches a dialplan context on the way out.
+;                                  The tenant comes from the campaign, not from a
+;                                  context, so no dialplan support is needed.
+;=============================================================================
+
+[general]
+static = yes
+writeprotect = no
+clearglobalvars = no
+
+[globals]
+AI_STASIS_APP = callcenter-ai
+RECORDINGS_DIR = /var/spool/asterisk/recordings
+; The customer this deployment ran as before tenancy existed. The pre-tenancy
+; context names at the bottom of this file forward to it, which is what keeps an
+; already-provisioned softphone and every documented smoke-test command working.
+LEGACY_TENANT_SLUG = ${ASTERISK_LEGACY_TENANT_SLUG}
+
+;=============================================================================
+; TEMPLATES - one copy of the logic, inherited by every tenant's contexts.
+;=============================================================================
+
+;--- Internal operators -------------------------------------------------------
+; Inherited as [from-internal-<slug>]; "from-internal-" is 14 characters.
+
+[tenant-internal](!)
+
+; Operator-to-operator inside ONE customer.
+;
+; Rings the desk phone AND the operator's browser phone at once. 101 -> 201 via
+; ${EXTEN:1} ("101" -> "01" -> "2" + "01"), so whichever one the operator is
+; actually sitting at picks up and the other stops ringing. An unregistered leg
+; simply contributes nothing, so this is safe when only one is in use.
+exten => _1XX,1,NoOp(Internal call ${CALLERID(num)} -> ${EXTEN} in ${CONTEXT} (desk + web))
+ same => n,Set(TENANT_SLUG=${CONTEXT:14})
+ same => n,Set(CDR(userfield)=internal)
+ same => n,Dial(PJSIP/${TENANT_SLUG}-${EXTEN}&PJSIP/${TENANT_SLUG}-2${EXTEN:1},30,tT)
+ same => n,Goto(dialstatus-${DIALSTATUS},1)
+
+; Direct dial to a browser phone only.
+exten => _2XX,1,NoOp(Web phone call ${CALLERID(num)} -> ${EXTEN} in ${CONTEXT})
+ same => n,Set(TENANT_SLUG=${CONTEXT:14})
+ same => n,Set(CDR(userfield)=internal-web)
+ same => n,Dial(PJSIP/${TENANT_SLUG}-${EXTEN},30,tT)
+ same => n,Goto(dialstatus-${DIALSTATUS},1)
+
+exten => dialstatus-BUSY,1,NoOp(Busy)
+ same => n,Voicemail(${EXTEN}@default,bu)
+ same => n,Hangup()
+
+exten => dialstatus-NOANSWER,1,NoOp(No answer)
+ same => n,Voicemail(${EXTEN}@default,u)
+ same => n,Hangup()
+
+exten => dialstatus-CHANUNAVAIL,1,NoOp(Unavailable)
+ same => n,Playback(ss-noservice)
+ same => n,Hangup()
+
+exten => dialstatus-CONGESTION,1,NoOp(Congestion)
+ same => n,Congestion(5)
+ same => n,Hangup()
+
+exten => dialstatus-ANSWER,1,NoOp(Answered - normal clearing)
+ same => n,Hangup()
+
+; The AI agent. Dial 900 from any softphone to talk to it.
+;
+; The tenant is passed to Stasis as an ARGUMENT rather than left to be inferred:
+; whatever the backend decides here becomes calls.tenant_id and is inherited by
+; the contact, the transcript, the recording and the ticket, so it is stated
+; explicitly by the only party that knows - the dialplan.
+exten => 900,1,NoOp(AI agent requested by ${CALLERID(num)} in ${CONTEXT})
+ same => n,Set(TENANT_SLUG=${CONTEXT:14})
+ same => n,Stasis(${AI_STASIS_APP},tenant=${TENANT_SLUG})
+ same => n,Hangup()
+
+; Echo test - proves two-way RTP without involving the AI or the backend.
+exten => 600,1,NoOp(Echo test)
+ same => n,Answer()
+ same => n,Playback(demo-echotest)
+ same => n,Echo()
+ same => n,Playback(demo-echodone)
+ same => n,Hangup()
+
+; Plays a fixed prompt. Proves one-way RTP and codec negotiation.
+exten => 601,1,NoOp(Playback test)
+ same => n,Answer()
+ same => n,Wait(1)
+ same => n,Playback(hello-world)
+ same => n,Hangup()
+
+; Music on hold test.
+exten => 602,1,NoOp(MoH test)
+ same => n,Answer()
+ same => n,MusicOnHold(default,30)
+ same => n,Hangup()
+
+; Voicemail retrieval.
+exten => 700,1,NoOp(Voicemail main)
+ same => n,Answer()
+ same => n,VoiceMailMain(${CALLERID(num)}@default)
+ same => n,Hangup()
+
+;--- Inbound from a tenant's own SIP trunk ------------------------------------
+; Inherited as [from-external-<slug>]; "from-external-" is 14 characters.
+;
+; Every external caller goes straight to that customer's AI agent. The backend
+; decides whether to keep talking or transfer to one of THEIR humans.
+
+[tenant-external](!)
+
+exten => _.,1,NoOp(External inbound from ${CALLERID(num)} to ${EXTEN} in ${CONTEXT})
+ same => n,Set(TENANT_SLUG=${CONTEXT:14})
+ same => n,Set(CDR(userfield)=inbound-ai)
+ same => n,Stasis(${AI_STASIS_APP},tenant=${TENANT_SLUG})
+ same => n,Hangup()
+
+exten => i,1,NoOp(Invalid external extension)
+ same => n,Hangup()
+
+;--- AudioSocket bridge -------------------------------------------------------
+; Inherited as [ai-bridge-<slug>]; "ai-bridge-" is 10 characters.
+;
+; Entered only via ARI continueInDialplan, after the backend has set AS_UUID and
+; AS_HOST on the channel. Recording starts first so the greeting is captured too.
+;
+; The recording goes into the TENANT's own directory. One flat directory would
+; mean one customer's recording file sitting next to another's, and the route that
+; serves them is deliberately unauthenticated (an <audio> element cannot send a
+; header) - so the directory is the boundary and it has a tenant in it.
+;
+; Serves BOTH directions unchanged: an answered outbound campaign call is a
+; channel in Stasis exactly like an inbound one.
+
+[tenant-ai-bridge](!)
+
+exten => s,1,NoOp(AudioSocket bridge uuid=${AS_UUID} host=${AS_HOST} in ${CONTEXT})
+ same => n,Set(TENANT_SLUG=${CONTEXT:10})
+ same => n,GotoIf($["${AS_UUID}" = ""]?missing,1)
+ same => n,GotoIf($["${AS_HOST}" = ""]?missing,1)
+ same => n,Set(MIXMON_FILE=${RECORDINGS_DIR}/${TENANT_SLUG}/${AS_UUID}.wav)
+ same => n,MixMonitor(${MIXMON_FILE},)
+ same => n,AudioSocket(${AS_UUID},${AS_HOST})
+ same => n,NoOp(AudioSocket ended status=${AUDIOSOCKETSTATUS})
+ same => n,Hangup()
+
+exten => missing,1,NoOp(AS_UUID or AS_HOST not set - backend did not prepare the channel)
+ same => n,Playback(technical-difficulties)
+ same => n,Hangup()
+
+;--- Human transfer -----------------------------------------------------------
+; Inherited as [ai-transfer-<slug>]; "ai-transfer-" is 12 characters.
+;
+; Used when the AI calls its transfer_to_human tool. The backend originates a
+; channel into this context, then bridges it with the caller via ARI. Only this
+; customer's own operators can be reached from here - the whole reason a transfer
+; must not run in a shared context is that "101" would otherwise be a race.
+
+[tenant-ai-transfer](!)
+
+exten => _1XX,1,NoOp(AI transferring caller to operator ${EXTEN} in ${CONTEXT} (desk + web))
+ same => n,Set(TENANT_SLUG=${CONTEXT:12})
+ same => n,Dial(PJSIP/${TENANT_SLUG}-${EXTEN}&PJSIP/${TENANT_SLUG}-2${EXTEN:1},25,tT)
+ same => n,Hangup()
+
+exten => _2XX,1,NoOp(AI transferring caller to web phone ${EXTEN} in ${CONTEXT})
+ same => n,Set(TENANT_SLUG=${CONTEXT:12})
+ same => n,Dial(PJSIP/${TENANT_SLUG}-${EXTEN},25,tT)
+ same => n,Hangup()
+
+;--- AI -> operator QUEUE (ACD) -----------------------------------------------
+; Inherited as [queue-<slug>]; "queue-" is 6 characters.
+;
+; This is the professional hand-off: instead of ringing ONE operator and dropping
+; the caller when they do not answer, the AI redirects the caller here and
+; app_queue distributes the call across the tenant's whole operator pool. A free
+; operator is rung immediately; an operator already on a call is skipped
+; (ringinuse=no in the queue); and when EVERY operator is busy the caller waits on
+; hold music until one frees up - "bo'sh operatorga darhol, hammasi band bo'lsa
+; kutish". The queue object itself (<slug>-ops and its members) is generated into
+; generated/queues-tenants.conf from operator_profiles.
+;
+; The backend AMI-Redirects the caller to queue-<slug>,s,1. QUEUESTATUS tells us
+; why Queue() returned: an answered call bridges and this dialplan is not reached
+; again until the operator hangs up (option c keeps the caller here); a timeout or
+; an empty queue falls through to the apology.
+
+[tenant-queue](!)
+
+exten => s,1,NoOp(ACD queue entry in ${CONTEXT} for ${CALLERID(num)})
+ same => n,Set(TENANT_SLUG=${CONTEXT:6})
+ same => n,Answer()
+ same => n,Set(CDR(userfield)=ai-queue)
+ ; No options: when an operator answers and the call completes, the caller is
+ ; released with them. The 5th arg (120) is the MAX SECONDS a caller waits before
+ ; the queue gives up - so Queue() only RETURNS to the dialplan below when NOBODY
+ ; answered (timeout / empty / unavailable), which is the only time the apology
+ ; should play. A completed call never reaches it.
+ same => n,Queue(${TENANT_SLUG}-ops,,,,120)
+ same => n,NoOp(Queue ${TENANT_SLUG}-ops ended with no operator: status=${QUEUESTATUS})
+ same => n,Playback(vm-nobodyavail)
+ same => n,Hangup()
+
+;--- Click-to-call ------------------------------------------------------------
+; Inherited as [click-to-call-<slug>]; "click-to-call-" is 14 characters.
+;
+; The backend originates PJSIP/<slug>-<ext> into here to ring an operator, then
+; bridges the answered channel to the outbound leg. ${EXTEN} is the DESTINATION,
+; which may be one of this tenant's own extensions or an outside number: an
+; internal target is their own endpoint, and anything else leaves over their own
+; trunk, which is the only carrier they are allowed to use.
+
+[tenant-click-to-call](!)
+
+exten => _X.,1,NoOp(Click-to-call to ${EXTEN} in ${CONTEXT})
+ same => n,Set(TENANT_SLUG=${CONTEXT:14})
+ same => n,Set(CDR(userfield)=outbound-c2c)
+ same => n,Set(TARGET=PJSIP/${TENANT_SLUG}-${EXTEN})
+ same => n,ExecIf($["${DEVICE_STATE(${TARGET})}"="INVALID"]?Set(TARGET=PJSIP/${EXTEN}@trunk-${TENANT_SLUG}))
+ same => n,Dial(${TARGET},45,tT)
+ same => n,Hangup()
+
+;=============================================================================
+; PRE-TENANCY CONTEXT NAMES.
+;
+; These are the context names this platform used before it had tenants, and they
+; are kept because things outside this file still say them: an already-registered
+; softphone whose endpoint predates tenancy, the smoke-test command in the
+; runbook (`channel originate Local/900@from-internal`), and the backend's own
+; fallback for a deployment whose generated config has not been written yet.
+;
+; They FORWARD to the legacy tenant rather than duplicating the dialplan, so a
+; call arriving through an old name is attributed to the right customer instead of
+; landing in a context with no tenant in it - which the backend would have to
+; refuse. ${LEGACY_TENANT_SLUG} comes from .env, so there is no second opinion
+; about which customer that is.
+;=============================================================================
+
+[from-internal]
+
+exten => _X.,1,NoOp(Pre-tenancy context: forwarding ${EXTEN} to ${LEGACY_TENANT_SLUG})
+ same => n,Goto(from-internal-${LEGACY_TENANT_SLUG},${EXTEN},1)
+
+exten => i,1,NoOp(Invalid extension in the pre-tenancy internal context)
+ same => n,Hangup()
+
+[from-external]
+
+exten => _.,1,NoOp(Pre-tenancy context: forwarding external ${EXTEN} to ${LEGACY_TENANT_SLUG})
+ same => n,Goto(from-external-${LEGACY_TENANT_SLUG},${EXTEN},1)
+
+exten => i,1,NoOp(Invalid extension in the pre-tenancy external context)
+ same => n,Hangup()
+
+[ai-bridge]
+
+exten => s,1,NoOp(Pre-tenancy bridge: forwarding to ai-bridge-${LEGACY_TENANT_SLUG})
+ same => n,Goto(ai-bridge-${LEGACY_TENANT_SLUG},s,1)
+
+[ai-transfer]
+
+exten => _X.,1,NoOp(Pre-tenancy transfer: forwarding ${EXTEN} to ${LEGACY_TENANT_SLUG})
+ same => n,Goto(ai-transfer-${LEGACY_TENANT_SLUG},${EXTEN},1)
+
+[queue]
+
+exten => s,1,NoOp(Pre-tenancy queue: forwarding to queue-${LEGACY_TENANT_SLUG})
+ same => n,Goto(queue-${LEGACY_TENANT_SLUG},s,1)
+
+[click-to-call]
+
+exten => _X.,1,NoOp(Pre-tenancy click-to-call: forwarding ${EXTEN} to ${LEGACY_TENANT_SLUG})
+ same => n,Goto(click-to-call-${LEGACY_TENANT_SLUG},${EXTEN},1)
+
+;=============================================================================
+; The per-tenant contexts themselves: generated from the tenants table by
+; apps/backend/src/lib/asterisk/tenant-config.ts, reloaded over AMI, and
+; bind-mounted into the container. Last, because the templates above must be
+; defined before a context can inherit them.
+;=============================================================================
+#include "generated/extensions-tenants.conf"

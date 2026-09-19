@@ -1,0 +1,19 @@
+;=============================================================================
+; http.conf - embedded HTTP server (carries ARI and the AMI-over-HTTP bridge)
+;
+; Bound to 0.0.0.0 because the backend runs outside the container. Port 8088
+; is published to localhost only in docker-compose, so it is not exposed to
+; the LAN. In production Nginx terminates TLS in front of it.
+;=============================================================================
+
+[general]
+enabled = yes
+bindaddr = 0.0.0.0
+bindport = 8088
+; No static content is served - ARI and AMI are the only consumers.
+enablestatic = no
+; Identify ourselves plainly; the default leaks the Asterisk version.
+server_name = callcenter-pbx
+sessionlimit = 200
+session_inactivity = 30000
+session_keep_alive = 15000

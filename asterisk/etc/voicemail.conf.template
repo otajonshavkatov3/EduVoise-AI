@@ -1,0 +1,30 @@
+;=============================================================================
+; voicemail.conf
+;
+; PINs are generated into .env (VOICEMAIL_PIN_1xx) and substituted at
+; container start, so no credential is committed to git.
+;=============================================================================
+
+[general]
+format = wav49|wav
+attach = no
+maxmsg = 100
+maxsecs = 300
+minsecs = 2
+maxsilence = 5
+silencethreshold = 128
+maxlogins = 3
+emaildateformat = %A, %d %B %Y at %H:%M:%S
+pagerdateformat = %d.%m.%Y %H:%M
+; The dashboard is where operators read voicemail metadata; Asterisk itself
+; sends no mail, so no SMTP dependency is pulled into the image.
+sendvoicemail = no
+
+[zonemessages]
+tashkent = Asia/Tashkent|'vm-received' Q 'digits/at' HM
+
+[default]
+101 => ${VOICEMAIL_PIN_101},Operator 101,,,tz=tashkent|attach=no
+102 => ${VOICEMAIL_PIN_102},Operator 102,,,tz=tashkent|attach=no
+103 => ${VOICEMAIL_PIN_103},Operator 103,,,tz=tashkent|attach=no
+104 => ${VOICEMAIL_PIN_104},Operator 104,,,tz=tashkent|attach=no

@@ -1,0 +1,32 @@
+;=============================================================================
+; manager.conf - AMI
+;
+; ARI covers call control, so AMI is used only for the things ARI does not
+; expose cleanly: PJSIP contact/registration state and endpoint health.
+;
+; The account is restricted to RFC1918 space. Port 5038 is published to
+; localhost only in docker-compose, so reaching it already requires being on
+; this host.
+;=============================================================================
+
+[general]
+enabled = yes
+webenabled = yes
+bindaddr = 0.0.0.0
+port = 5038
+displayconnects = no
+timestampevents = yes
+; Drop the noisiest event classes so the backend's AMI reader is not flooded
+; during load; call control comes from ARI anyway.
+channelvars =
+
+[${ASTERISK_AMI_USERNAME}]
+secret = ${ASTERISK_AMI_PASSWORD}
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.0.0.0
+permit = 10.0.0.0/255.0.0.0
+permit = 172.16.0.0/255.240.0.0
+permit = 192.168.0.0/255.255.0.0
+read = system,call,agent,user,dtmf,reporting,cdr,dialplan
+write = system,call,agent,user,command,originate,reporting
+writetimeout = 5000

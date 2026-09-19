@@ -1,0 +1,34 @@
+;=============================================================================
+; rtp.conf - RTP media port range
+;
+; Deliberately small (50 ports = 25 concurrent calls). Docker Desktop creates
+; one userland proxy per published UDP port, so a conventional
+; 10000-20000 range makes `docker compose up` take minutes and eats RAM.
+; Raise ASTERISK_RTP_END for production on a real Linux host, where publishing
+; is handled by iptables and costs nothing.
+;=============================================================================
+
+[general]
+rtpstart = ${ASTERISK_RTP_START}
+rtpend = ${ASTERISK_RTP_END}
+; Tear down a call whose media dies, so a crashed softphone does not leave a
+; channel (and an OpenAI Realtime session) up forever.
+rtptimeout = 60
+rtpholdtimeout = 300
+rtpkeepalive = 15
+
+; ICE must be ON globally or the dashboard's browser softphone gets no audio -
+; every WebRTC implementation requires ICE. This does NOT change the desk-phone
+; path: ICE is only offered on endpoints whose own ice_support is yes, which is
+; just the WebRTC endpoints (201-204, via webrtc=yes). MicroSIP and the 101-104
+; endpoints leave ice_support at its default of no and negotiate plain RTP
+; exactly as before.
+;
+; entrypoint.sh appends an [ice_host_candidates] section below at container
+; start, rewriting the container's own 172.x host candidate to 127.0.0.1 so the
+; browser can actually reach the published RTP ports.
+icesupport = yes
+
+; No STUN server: everything here is host-local, and a public STUN lookup would
+; only add candidates that resolve to the Docker bridge.
+stunaddr =

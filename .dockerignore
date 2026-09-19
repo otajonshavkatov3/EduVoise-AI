@@ -1,0 +1,64 @@
+# =============================================================================
+# .dockerignore - keeps the build context small and secret-free.
+#
+# Applies to EVERY image built from this repository root: deploy/backend.Dockerfile,
+# deploy/frontend.Dockerfile and docker/asterisk.Dockerfile. Nothing the Asterisk
+# image copies (asterisk/etc/*, asterisk/scripts/*) is excluded here.
+# =============================================================================
+
+# Installed dependencies: they are reinstalled inside the image for the correct
+# platform. Shipping the host's node_modules would also break native modules.
+node_modules
+**/node_modules
+
+# Build output - regenerated in the image.
+dist
+**/dist
+build
+.next
+.output
+*.tsbuildinfo
+
+# Secrets and local state. .env MUST never enter an image layer: production
+# secrets arrive at runtime through env_file/environment.
+.env
+.env.*
+!.env.example
+.deploy-state
+nginx/conf.d.rendered
+monitoring/prometheus/secrets
+
+# Local development services (a whole Postgres data directory lives here).
+.localdev
+
+# Call recordings: gigabytes of audio, and they contain personal data.
+apps/backend/uploads
+uploads
+
+# Version control and editor noise.
+.git
+.gitignore
+.github
+.husky
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Logs and backups.
+logs
+*.log
+backups
+
+# Tests and docs are not needed at runtime.
+tests
+docs
+*.md
+!README.md
+
+# Docker/compose files themselves: changing a compose file must not invalidate
+# every build cache layer.
+docker-compose*.yml
+Dockerfile*
+*.Dockerfile
+.dockerignore

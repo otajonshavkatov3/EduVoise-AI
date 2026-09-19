@@ -1,0 +1,32 @@
+# =============================================================================
+# Grafana dashboard provisioning
+#
+# Mounted at /etc/grafana/provisioning/dashboards/dashboards.yml. Every *.json
+# in the same directory is imported into the "CallCenter" folder on start and
+# re-checked every updateIntervalSeconds, so `git pull` + container restart is
+# the whole dashboard deployment process.
+# =============================================================================
+apiVersion: 1
+
+providers:
+  - name: callcenter
+    orgId: 1
+    # Dashboards land in this folder instead of "General", which keeps them
+    # apart from anything an operator saves by hand.
+    folder: CallCenter
+    folderUid: callcenter
+    type: file
+    # true would delete provisioned dashboards from the database when the files
+    # disappear. false is safer: a bad mount cannot wipe the dashboards.
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    # Lets an on-call engineer tweak a panel live during an incident. The change
+    # is overwritten the next time the file changes on disk, which is the
+    # behaviour we want - the repo stays authoritative.
+    allowUiUpdates: true
+    options:
+      # Path INSIDE the container.
+      path: /etc/grafana/provisioning/dashboards
+      # false: keep everything in the single CallCenter folder rather than
+      # mirroring subdirectories as folders.
+      foldersFromFilesStructure: false

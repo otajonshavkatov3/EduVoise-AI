@@ -1,0 +1,75 @@
+;=============================================================================
+; pjsip.conf - SIP signalling for CallCenter "Aqlli Shahar"
+;
+; Rendered from pjsip.conf.template by asterisk/scripts/entrypoint.sh.
+; Only the ${...} names listed in that script's envsubst whitelist are
+; substituted, so dialplan-style variables elsewhere survive untouched.
+;
+; WHAT IS *NOT* IN THIS FILE ANY MORE: the endpoints. There are no operator
+; endpoints, no browser softphone endpoints and no trunk here, because every one
+; of them belongs to a CUSTOMER and customers are database rows. They live in
+; generated/pjsip-tenants.conf, rendered from the tenants table by
+; apps/backend/src/lib/asterisk/tenant-config.ts and reloaded over AMI, so
+; onboarding a customer needs neither a container rebuild nor a restart. The
+; container writes that file itself from .env if it does not exist yet, which is
+; what makes a fresh clone - or a boot with the database down - still work.
+;
+; Endpoint names carry the tenant (`avilab-101`) and the AUTH USERNAME is the
+; endpoint name, not the digits: REGISTER has no tenant field, so two customers'
+; "101" would be one global credential and Asterisk would match a registration to
+; whichever it hashed first. The digits stay in the dialplan, where the customer
+; dials them. See lib/tenancy/asterisk-naming.ts for the one naming contract all
+; three sides (generator, dialplan, channel resolver) derive from.
+;
+; The AI agent needs no endpoint at all: it is reached through the dialplan
+; (Stasis) and speaks over AudioSocket, not SIP.
+;=============================================================================
+
+;--- Transports --------------------------------------------------------------
+
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:${ASTERISK_SIP_PORT}
+${ASTERISK_TRANSPORT_NAT}
+
+[transport-tcp]
+type = transport
+protocol = tcp
+bind = 0.0.0.0:${ASTERISK_SIP_PORT}
+${ASTERISK_TRANSPORT_NAT}
+
+;=============================================================================
+; Browser softphone transport (SIP-in-WebSocket)
+;
+; The endpoints that use it are generated per tenant with webrtc=yes. They are
+; separate endpoints from the desk phones rather than extra contacts on them
+; because WebRTC forces DTLS-SRTP and AVPF, which a plain SIP softphone must not
+; be offered.
+;
+; Codecs on those endpoints are ulaw/alaw only: Chrome supports PCMU/PCMA
+; natively, and Ubuntu's Asterisk build ships no Opus codec, so offering opus
+; would negotiate nothing.
+;
+; The DTLS certificate is generated on first boot by
+; asterisk/scripts/entrypoint.sh - it is self-signed, which is fine because
+; WebRTC verifies the fingerprint from the SDP, not a CA chain.
+;=============================================================================
+
+[transport-ws]
+type = transport
+protocol = ws
+bind = 0.0.0.0
+local_net = 10.0.0.0/8
+local_net = 172.16.0.0/12
+local_net = 192.168.0.0/16
+local_net = 127.0.0.0/8
+
+;=============================================================================
+; Every customer's endpoints, auths, aors and trunks.
+;
+; Written by the backend from the tenants table; bootstrapped from .env by
+; entrypoint.sh when absent. Reloaded with `Reload res_pjsip.so` over AMI, which
+; is why a new customer is answering calls a second after the vendor creates them.
+;=============================================================================
+#include "generated/pjsip-tenants.conf"

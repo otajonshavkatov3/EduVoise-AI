@@ -1,0 +1,195 @@
+# =============================================================================
+# prometheus.yml - scrape configuration for CallCenter "Aqlli Shahar"
+#
+# Mounted read-only at /etc/prometheus/prometheus.yml by the `prometheus`
+# service in docker-compose.prod.yml. All targets are reached over the private
+# compose network by SERVICE NAME - none of these ports is published to the
+# internet (see config/firewall/ufw-rules.sh).
+#
+# -----------------------------------------------------------------------------
+# METRIC CONTRACT (what alerts.yml and the Grafana dashboard expect the backend
+# to expose at GET /metrics on port 4000, in Prometheus text format):
+#
+#   http_request_duration_seconds_bucket{method,route,status,le}  histogram
+#   http_requests_total{method,route,status}                      counter
+#   callcenter_calls_total{direction,status}                      counter
+#   callcenter_call_talk_seconds_sum / _count                     histogram/summary
+#   callcenter_active_channels                                    gauge
+#   callcenter_active_calls{status}                               gauge
+#   callcenter_ai_sessions_started_total                          counter
+#   callcenter_ai_sessions_total{status}                          counter  (completed|failed|abandoned)
+#   callcenter_ai_sessions_active                                 gauge
+#   callcenter_transfers_total{status}                            counter  (connected|failed|abandoned)
+#   callcenter_ari_connected                                      gauge 1/0 (ARI event WebSocket)
+#   callcenter_ami_connected                                      gauge 1/0
+#   callcenter_audiosocket_connections                            gauge
+#   callcenter_dependency_up{dependency}                          gauge 1/0 (postgres|redis|asterisk_ari|asterisk_ami|openai)
+#   callcenter_sip_extension_registered{extension,kind}           gauge 1/0 (from AMI PJSIPShowEndpoints)
+#   callcenter_recordings_bytes_total                             gauge
+#
+# Keep this list and alerts.yml in sync: a renamed metric turns an alert into
+# silence, which is worse than a noisy alert.
+# =============================================================================
+
+global:
+  # 15s is the standard trade-off: fast enough that a 2-minute `for:` clause has
+  # 8 samples behind it, cheap enough that 30 days of retention fits in a few GB
+  # on a small VPS.
+  scrape_interval: 15s
+  # Must stay below scrape_interval, otherwise a slow target stalls the whole
+  # scrape loop for its job.
+  scrape_timeout: 10s
+  # Rules are evaluated on the same cadence as scraping; evaluating faster than
+  # data arrives only wastes CPU.
+  evaluation_interval: 15s
+
+  # Attached to every series and to every alert leaving this server, so a future
+  # federated/remote-write setup can tell prod from staging.
+  external_labels:
+    cluster: callcenter
+    env: production
+
+# Alerting rules live in their own file so they can be edited and reloaded
+# (`curl -X POST http://127.0.0.1:9090/-/reload`) without touching this one.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    # No Alertmanager is deployed yet: until it is, firing alerts are visible in
+    # the Prometheus UI (http://127.0.0.1:9090/alerts) and through Grafana's
+    # alert list panel. Add the service to docker-compose.prod.yml and uncomment
+    # this block to get Telegram/e-mail delivery.
+    - static_configs:
+        - targets: []
+          # - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # Prometheus itself.
+  #
+  # Exists so the monitoring system can report its own failures: rule evaluation
+  # errors, dropped samples and TSDB compaction problems all surface here. If
+  # this job is missing you will not notice that your alerting engine is broken.
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+        labels:
+          service: monitoring
+
+  # ---------------------------------------------------------------------------
+  # Backend (Bun + Hono).
+  #
+  # The most important job in this file: it carries the business metrics (calls,
+  # AI sessions, transfers), the API latency histogram that the <200ms p95
+  # requirement from TZ.md section "Performance" is measured against, and the
+  # dependency gauges used for the Redis/Postgres/ARI alerts.
+  #
+  # Scraped every 10s rather than 15s because the API-latency and
+  # calls-answered alerts have short evaluation windows and benefit from the
+  # extra resolution.
+  # ---------------------------------------------------------------------------
+  - job_name: backend
+    metrics_path: /metrics
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    static_configs:
+      - targets: ["backend:4000"]
+        labels:
+          service: callcenter-api
+    # If the metrics route ends up mounted under the API prefix instead of the
+    # server root, change metrics_path to /api/metrics - nothing else here
+    # depends on the path.
+    metric_relabel_configs:
+      # Bun/Go-style process metrics are useful, but the per-quantile GC series
+      # is pure noise at this scale. Dropping it keeps the TSDB small.
+      - source_labels: [__name__]
+        regex: "go_gc_duration_seconds.*"
+        action: drop
+
+  # ---------------------------------------------------------------------------
+  # Asterisk (res_prometheus).
+  #
+  # Gives channel/endpoint/bridge counts straight from the PBX, which is the
+  # ground truth the dashboard's "live channels" panel is validated against -
+  # the backend's own counter can drift if it misses an ARI event.
+  #
+  # REQUIREMENT: res_prometheus only answers once /etc/asterisk/prometheus.conf
+  # exists inside the Asterisk image:
+  #
+  #     [general]
+  #     enabled = yes
+  #     uri = metrics
+  #     auth_username = <ASTERISK_ARI_USERNAME>
+  #     auth_password = <ASTERISK_ARI_PASSWORD>
+  #
+  # Until that file is added the endpoint returns 404 and this target shows as
+  # down. That is why alerts.yml raises only a WARNING off `up{job="asterisk"}`
+  # (AsteriskMetricsEndpointDown) and keys the real page-worthy AsteriskDown
+  # alert off the backend's ARI/AMI connectivity gauges instead.
+  # ---------------------------------------------------------------------------
+  - job_name: asterisk
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 15s
+    basic_auth:
+      # Must match ASTERISK_ARI_USERNAME in .env (deploy.sh defaults it to this
+      # value). res_prometheus authenticates against the same http.conf realm.
+      username: callcenter-ari
+      # Rendered from ASTERISK_ARI_PASSWORD by scripts/deploy.sh. Prometheus
+      # does NOT expand environment variables in this file, so the secret has to
+      # arrive as a file - never paste it here.
+      password_file: /etc/prometheus/secrets/asterisk_password
+    static_configs:
+      - targets: ["asterisk:8088"]
+        labels:
+          service: asterisk-pbx
+
+  # ---------------------------------------------------------------------------
+  # node-exporter.
+  #
+  # Host-level truth: CPU steal on a cheap VPS, memory pressure that makes
+  # Asterisk drop RTP, and - the reason it is non-negotiable here - filesystem
+  # space for the recordings directory. Call recordings grow monotonically and
+  # a full disk stops Asterisk from writing new ones AND stops Postgres from
+  # committing, so RecordingDiskFillingUp is one of the sharpest alerts we have.
+  #
+  # 30s interval: host metrics move slowly and this exporter returns a large
+  # payload.
+  # ---------------------------------------------------------------------------
+  - job_name: node-exporter
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          service: host
+
+  # ---------------------------------------------------------------------------
+  # postgres-exporter.
+  #
+  # Connection-pool exhaustion, replication/transaction age, deadlocks and
+  # database size. pg_up from this job is the authoritative "is the database
+  # reachable" signal, independent of whether the backend is healthy.
+  # ---------------------------------------------------------------------------
+  - job_name: postgres-exporter
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          service: postgres
+
+  # ---------------------------------------------------------------------------
+  # Redis has no exporter in this stack, so the RedisDown alert reads the
+  # backend's callcenter_dependency_up{dependency="redis"} gauge. If you want
+  # Redis internals (keyspace, evictions, replication), add
+  #   redis-exporter (oliver006/redis_exporter) to docker-compose.prod.yml
+  # and enable the job below.
+  #
+  # - job_name: redis-exporter
+  #   scrape_interval: 30s
+  #   static_configs:
+  #     - targets: ["redis-exporter:9121"]
+  #       labels:
+  #         service: redis
+  # ---------------------------------------------------------------------------

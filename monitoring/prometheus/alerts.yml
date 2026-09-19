@@ -1,0 +1,675 @@
+# =============================================================================
+# alerts.yml - alerting rules for CallCenter "Aqlli Shahar"
+#
+# Loaded by prometheus.yml (rule_files). Validate before reloading:
+#   docker compose exec prometheus promtool check rules /etc/prometheus/alerts.yml
+#   docker compose exec prometheus kill -HUP 1     # or POST /-/reload
+#
+# CONVENTIONS
+#   severity: critical -> wake somebody up; calls are being lost right now.
+#   severity: warning  -> fix during the working day; degradation, not outage.
+#   severity: info     -> context only, never routed to a pager.
+#   Every rule carries service= so Alertmanager can route by component, and a
+#   description that names the concrete consequence for the call centre - an
+#   alert nobody can act on is noise.
+#
+# TIMEZONE
+#   PromQL's hour() and day_of_week() are UTC. Tashkent is UTC+5, so the
+#   business day 09:00-18:00 local is 04:00-13:00 UTC, Monday-Friday
+#   (day_of_week 1-5). Change both numbers together if the shift pattern moves.
+# =============================================================================
+
+groups:
+  # ===========================================================================
+  # Availability of the moving parts. These are the "is anything alive" rules.
+  # ===========================================================================
+  - name: callcenter.availability
+    interval: 30s
+    rules:
+      - alert: BackendDown
+        # up==0 means the scrape itself failed: process dead, port closed, or
+        # the container is being restarted in a crash loop.
+        expr: up{job="backend"} == 0
+        # 1m = 6 consecutive failed 10s scrapes. Short, because with the backend
+        # down nobody can log in, no call is logged and no ticket can be created.
+        for: 1m
+        labels:
+          severity: critical
+          service: callcenter-api
+          team: callcenter
+        annotations:
+          summary: "Backend API is down ({{ $labels.instance }})"
+          description: >-
+            Prometheus cannot scrape {{ $labels.instance }}. The dashboard,
+            the operator softphone signalling and all call/ticket logging are
+            unavailable. Check `docker compose logs --tail=200 backend`.
+          runbook_url: "https://github.com/aqlli-shahar/callcenter/blob/main/docs/runbooks/backend-down.md"
+
+      - alert: AsteriskDown
+        # Keyed off the backend's live ARI connectivity gauge rather than off
+        # up{job="asterisk"}: the metrics endpoint needs res_prometheus, which is
+        # optional, whereas the ARI socket is what actually carries calls.
+        expr: callcenter_dependency_up{dependency="asterisk_ari"} == 0
+        # 2m tolerates a normal Asterisk restart (~20s) without paging.
+        for: 2m
+        labels:
+          severity: critical
+          service: asterisk-pbx
+          team: callcenter
+        annotations:
+          summary: "Asterisk PBX unreachable from the backend"
+          description: >-
+            The backend has had no ARI connection to Asterisk for 2 minutes.
+            Inbound calls are not entering Stasis, so the AI agent cannot answer
+            and click-to-call is dead. Check the container
+            (`docker compose ps asterisk`) and ARI credentials.
+          runbook_url: "https://github.com/aqlli-shahar/callcenter/blob/main/docs/runbooks/asterisk-down.md"
+
+      - alert: AsteriskMetricsEndpointDown
+        # Only a warning: this fires permanently if /etc/asterisk/prometheus.conf
+        # was never created (res_prometheus disabled -> HTTP 404 -> up=0). It is
+        # here so the gap is visible instead of silently missing dashboards.
+        expr: up{job="asterisk"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          service: asterisk-pbx
+          team: callcenter
+        annotations:
+          summary: "Asterisk /metrics endpoint not scrapable"
+          description: >-
+            Prometheus cannot scrape res_prometheus on asterisk:8088. Channel
+            and endpoint panels in Grafana will be empty. Enable the module with
+            /etc/asterisk/prometheus.conf ([general] enabled=yes, uri=metrics)
+            or silence this alert if PBX-side metrics are not wanted.
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: postgres
+          team: callcenter
+        annotations:
+          summary: "PostgreSQL is down"
+          description: >-
+            postgres-exporter reports pg_up=0. Nothing can be persisted: calls
+            in progress will not be written, tickets cannot be saved. Check
+            `docker compose logs --tail=100 postgres` and disk space first -
+            a full filesystem is the most common cause.
+          runbook_url: "https://github.com/aqlli-shahar/callcenter/blob/main/docs/runbooks/postgres-down.md"
+
+      - alert: PostgresUnreachableFromBackend
+        # Distinguishes "database is down" from "backend cannot reach a healthy
+        # database" (pool exhausted, wrong password after a secret rotation,
+        # network policy). Both matter, the fixes are different.
+        expr: callcenter_dependency_up{dependency="postgres"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: callcenter-api
+          team: callcenter
+        annotations:
+          summary: "Backend cannot reach PostgreSQL"
+          description: >-
+            The database answers the exporter but not the backend. Suspect a
+            saturated connection pool, DATABASE_URL drift, or too many idle
+            transactions.
+
+      - alert: RedisDown
+        # There is no redis-exporter in this stack, so the backend's own probe is
+        # the signal. If the backend is also down, BackendDown fires instead and
+        # this rule goes silent by design (no data -> no alert).
+        expr: callcenter_dependency_up{dependency="redis"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: redis
+          team: callcenter
+        annotations:
+          summary: "Redis unreachable from the backend"
+          description: >-
+            Sessions, rate limiting and the WebSocket presence registry depend
+            on Redis. Operators will be logged out and live-call fan-out stops.
+            Check `docker compose logs --tail=100 redis` and REDIS_PASSWORD.
+
+      - alert: MonitoringTargetDown
+        expr: up{job=~"node-exporter|postgres-exporter"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          service: monitoring
+          team: callcenter
+        annotations:
+          summary: "Exporter {{ $labels.job }} is down"
+          description: >-
+            {{ $labels.job }} at {{ $labels.instance }} has not been scrapable
+            for 10 minutes. Disk-space and database alerts that depend on it are
+            now blind.
+
+      - alert: BackupTooOld
+        # scripts/backup.sh writes callcenter_backup_last_success_timestamp_seconds
+        # into node-exporter's textfile collector directory after a VERIFIED
+        # dump. 26h allows a daily schedule to be a couple of hours late without
+        # paging. TZ.md sets RPO = 24h, so a missing backup is a real breach.
+        expr: time() - callcenter_backup_last_success_timestamp_seconds > 26 * 3600
+        for: 30m
+        labels:
+          severity: warning
+          service: backup
+          team: callcenter
+        annotations:
+          summary: "No verified database backup in the last 26 hours"
+          description: >-
+            Last successful, restore-verified dump was
+            {{ $value | humanizeDuration }} ago. The 24h RPO from TZ.md is
+            breached. Run scripts/backup.sh manually and read its log.
+
+      - alert: BackupMetricMissing
+        # `absent()` catches the case where backup.sh has never run at all - the
+        # rule above cannot fire on a series that does not exist.
+        expr: absent(callcenter_backup_last_success_timestamp_seconds)
+        for: 6h
+        labels:
+          severity: warning
+          service: backup
+          team: callcenter
+        annotations:
+          summary: "Backup metric absent - backups may never have run"
+          description: >-
+            callcenter_backup_last_success_timestamp_seconds does not exist.
+            Either the cron entry for scripts/backup.sh is missing or
+            node-exporter is not reading its textfile directory.
+
+  # ===========================================================================
+  # Telephony. Everything here answers: "can a citizen actually get through?"
+  # ===========================================================================
+  - name: callcenter.telephony
+    interval: 30s
+    rules:
+      - alert: AriEventStreamDisconnected
+        # The ARI event WebSocket is the ONLY way the backend learns about new
+        # channels. A dead stream looks like a healthy system from the outside
+        # while every call silently falls through to the dialplan fallback.
+        expr: callcenter_ari_connected == 0
+        for: 3m
+        labels:
+          severity: critical
+          service: asterisk-pbx
+          team: callcenter
+        annotations:
+          summary: "ARI event stream disconnected"
+          description: >-
+            ws://asterisk:8088/ari/events?app=callcenter-ai has been down for
+            3 minutes. Stasis(callcenter-ai) has no controller: calls entering
+            extension 900 will hang or be dumped to voicemail. The backend
+            reconnects with backoff - if this does not clear, restart the
+            backend, then Asterisk.
+          runbook_url: "https://github.com/aqlli-shahar/callcenter/blob/main/docs/runbooks/ari-disconnected.md"
+
+      - alert: AmiDisconnected
+        # AMI only feeds peer/registration state, so this degrades reporting
+        # rather than call handling - warning, not critical.
+        expr: callcenter_ami_connected == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: asterisk-pbx
+          team: callcenter
+        annotations:
+          summary: "AMI connection lost"
+          description: >-
+            SIP registration state and peer status are stale; the operator
+            presence panel and the SipRegistrationLost alert are unreliable
+            until AMI reconnects.
+
+      - alert: NoCallsAnsweredDuringBusinessHours
+        # Deliberately blunt: 20 minutes without a single answered call inside
+        # the working day means the trunk, the dialplan or the queue is broken.
+        # A genuinely quiet 20 minutes is rare for a municipal hotline, and a
+        # false positive here is far cheaper than a silent half-day outage.
+        expr: |
+          sum(increase(callcenter_calls_total{status="answered"}[20m])) == 0
+            and on() (hour() >= 4 and hour() < 13)
+            and on() (day_of_week() >= 1 and day_of_week() <= 5)
+        for: 5m
+        labels:
+          severity: critical
+          service: telephony
+          team: callcenter
+        annotations:
+          summary: "No answered calls for 20+ minutes during business hours"
+          description: >-
+            Zero calls reached the answered state in the last 20 minutes while
+            the call centre should be open. Check, in order: SIP trunk
+            registration, extension 900 / Stasis, operator availability
+            (all operators on pause?), and the from-external dialplan context.
+          runbook_url: "https://github.com/aqlli-shahar/callcenter/blob/main/docs/runbooks/no-calls.md"
+
+      - alert: NoInboundCallsDuringBusinessHours
+        # Distinct from the rule above: this one says traffic is not ARRIVING
+        # (dead trunk / DNS / provider outage) rather than not being answered.
+        expr: |
+          sum(increase(callcenter_calls_total{direction="inbound"}[30m])) == 0
+            and on() (hour() >= 4 and hour() < 13)
+            and on() (day_of_week() >= 1 and day_of_week() <= 5)
+        for: 10m
+        labels:
+          severity: warning
+          service: telephony
+          team: callcenter
+        annotations:
+          summary: "No inbound calls arriving for 30+ minutes during business hours"
+          description: >-
+            No inbound channel has been created in 30 minutes. The upstream SIP
+            provider or the 5070/udp path is the likely culprit - verify with
+            `asterisk -rx "pjsip show registrations"`.
+
+      - alert: SipRegistrationLost
+        # One series per extension, so the alert names the broken desk phone.
+        expr: callcenter_sip_extension_registered == 0
+        # 5m: a softphone restart or a laptop lid closing must not page anyone.
+        for: 5m
+        labels:
+          severity: warning
+          service: telephony
+          team: callcenter
+        annotations:
+          summary: "SIP extension {{ $labels.extension }} is not registered"
+          description: >-
+            Extension {{ $labels.extension }} ({{ $labels.kind }}) has been
+            unregistered for 5 minutes, so transfers to it will fail and the AI
+            agent will skip it. Check the softphone, then
+            `asterisk -rx "pjsip show endpoint {{ $labels.extension }}"`.
+
+      - alert: AllSipExtensionsUnregistered
+        # Every phone offline at once is an infrastructure problem, not four
+        # coincidences - and it means no transfer target exists at all.
+        expr: |
+          count(callcenter_sip_extension_registered{kind!="ai"} == 0)
+            == count(callcenter_sip_extension_registered{kind!="ai"})
+        for: 3m
+        labels:
+          severity: critical
+          service: telephony
+          team: callcenter
+        annotations:
+          summary: "No SIP extension is registered"
+          description: >-
+            All non-AI extensions are unregistered. Every AI-to-human transfer
+            will fail and callers will be sent to voicemail. Suspect the
+            5070/udp firewall rule, pjsip.conf rendering, or a NAT change.
+
+      - alert: HighMissedCallRatio
+        # >30% missed over 15 minutes with at least 10 calls of volume, so a
+        # 1-of-2-missed sample cannot trip it.
+        expr: |
+          (
+            sum(increase(callcenter_calls_total{status=~"missed|abandoned"}[15m]))
+            /
+            clamp_min(sum(increase(callcenter_calls_total[15m])), 1)
+          ) > 0.3
+            and on() sum(increase(callcenter_calls_total[15m])) >= 10
+            and on() (hour() >= 4 and hour() < 13)
+            and on() (day_of_week() >= 1 and day_of_week() <= 5)
+        for: 10m
+        labels:
+          severity: warning
+          service: telephony
+          team: callcenter
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of calls missed/abandoned"
+          description: >-
+            More than 30% of calls in the last 15 minutes were missed or
+            abandoned. Either the centre is understaffed for the current volume
+            or ring/answer timing in the dialplan is wrong.
+
+      - alert: LiveChannelsNearRtpCapacity
+        # Hard physical ceiling: the RTP range is 12000-12049 = 50 UDP ports, and
+        # each media stream consumes an RTP port plus its RTCP companion, so the
+        # host tops out around 25 simultaneous audio channels. At 20 we are one
+        # small burst away from calls failing with no audio.
+        expr: callcenter_active_channels > 20
+        for: 2m
+        labels:
+          severity: warning
+          service: telephony
+          team: callcenter
+        annotations:
+          summary: "{{ $value }} live channels - approaching the 25-channel RTP ceiling"
+          description: >-
+            The configured RTP range (12000-12049) supports ~25 concurrent media
+            streams. Widen ASTERISK_RTP_START/ASTERISK_RTP_END and republish the
+            port range before traffic grows further.
+
+      - alert: LiveChannelsAtRtpCapacity
+        expr: callcenter_active_channels >= 25
+        for: 1m
+        labels:
+          severity: critical
+          service: telephony
+          team: callcenter
+        annotations:
+          summary: "RTP port range exhausted ({{ $value }} channels)"
+          description: >-
+            New calls will connect with one-way or no audio because no RTP port
+            pair is free. Widen the RTP range immediately.
+
+  # ===========================================================================
+  # AI voice agent. The OpenAI Realtime path is the newest and least stable
+  # part of the platform, so it gets its own group and its own thresholds.
+  # ===========================================================================
+  - name: callcenter.ai
+    interval: 30s
+    rules:
+      - alert: AiSessionFailureRateHigh
+        # >20% of started sessions failing, with a floor of 5 sessions so a
+        # single failure in a quiet hour does not alert.
+        expr: |
+          (
+            sum(increase(callcenter_ai_sessions_total{status="failed"}[15m]))
+            /
+            clamp_min(sum(increase(callcenter_ai_sessions_started_total[15m])), 1)
+          ) > 0.2
+            and on() sum(increase(callcenter_ai_sessions_started_total[15m])) >= 5
+        for: 10m
+        labels:
+          severity: warning
+          service: ai-voice
+          team: callcenter
+        annotations:
+          summary: "AI session failure rate {{ $value | humanizePercentage }}"
+          description: >-
+            More than one in five AI voice sessions failed in the last 15
+            minutes. Callers are being handed to human operators by the
+            fallback path (which is working - that is why this is a warning).
+            Check the backend log for OpenAI errors: model_not_found means the
+            API key lost Realtime access, beta_api_shape_disabled means someone
+            re-added the OpenAI-Beta header.
+          runbook_url: "https://github.com/aqlli-shahar/callcenter/blob/main/docs/runbooks/ai-session-failures.md"
+
+      - alert: AiSessionsAllFailing
+        # >90% failure = the provider is effectively gone. Critical because the
+        # fallback to human operators must be verified as actually engaged,
+        # otherwise callers hear silence.
+        expr: |
+          (
+            sum(increase(callcenter_ai_sessions_total{status="failed"}[10m]))
+            /
+            clamp_min(sum(increase(callcenter_ai_sessions_started_total[10m])), 1)
+          ) > 0.9
+            and on() sum(increase(callcenter_ai_sessions_started_total[10m])) >= 3
+        for: 5m
+        labels:
+          severity: critical
+          service: ai-voice
+          team: callcenter
+        annotations:
+          summary: "Every AI voice session is failing"
+          description: >-
+            The AI provider is unusable. Confirm that calls are falling back to
+            human extensions (watch callcenter_transfers_total on the CallCenter
+            Overview dashboard); if they are not, set AI_AGENT_ENABLED=false and
+            restart the backend so calls go straight to operators.
+
+      - alert: AiSessionsNeverStart
+        # The agent is enabled and calls are arriving, yet no session is created:
+        # the AudioSocket listener, the ai-bridge dialplan or the provider
+        # handshake is broken before a session is ever recorded.
+        expr: |
+          sum(increase(callcenter_ai_sessions_started_total[30m])) == 0
+            and on() sum(increase(callcenter_calls_total{direction="inbound"}[30m])) > 5
+            and on() (hour() >= 4 and hour() < 13)
+        for: 10m
+        labels:
+          severity: warning
+          service: ai-voice
+          team: callcenter
+        annotations:
+          summary: "Inbound calls arriving but no AI session started in 30m"
+          description: >-
+            Calls are reaching the PBX but never reach the AI agent. Check that
+            AI_AGENT_ENABLED=true, that the AudioSocket listener on
+            AUDIOSOCKET_PORT (9092) is accepting connections, and that
+            AS_UUID/AS_HOST are set before continueInDialplan into ai-bridge.
+
+      - alert: AudioSocketNoConnections
+        # AI sessions counted but no AudioSocket connection means signalling is
+        # fine and MEDIA is not - the classic host.docker.internal / advertise
+        # host misconfiguration.
+        expr: |
+          callcenter_audiosocket_connections == 0
+            and on() callcenter_ai_sessions_active > 0
+        for: 3m
+        labels:
+          severity: critical
+          service: ai-voice
+          team: callcenter
+        annotations:
+          summary: "AI sessions active but no AudioSocket media connection"
+          description: >-
+            Asterisk is not connecting back to the backend's AudioSocket port.
+            Verify AUDIOSOCKET_ADVERTISE_HOST resolves from inside the Asterisk
+            container and that nothing else holds port 9092.
+
+  # ===========================================================================
+  # HTTP API service levels. TZ.md ("Performance") requires p95 < 200ms.
+  # ===========================================================================
+  - name: callcenter.api
+    interval: 30s
+    rules:
+      - alert: ApiLatencyP95AboveSlo
+        # sum by (le) aggregates every route into one histogram before taking the
+        # quantile - that is the number the SLO is written against. Per-route
+        # breakdowns belong in Grafana, not in the alert.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 0.2
+        # 10m: a single slow report export must not page; a sustained regression
+        # must.
+        for: 10m
+        labels:
+          severity: warning
+          service: callcenter-api
+          team: callcenter
+          slo: "api_latency_p95_200ms"
+        annotations:
+          summary: "API p95 latency {{ $value | humanizeDuration }} (SLO 200ms)"
+          description: >-
+            The 95th percentile request duration has exceeded the 200ms
+            requirement for 10 minutes. Look for missing indexes on the calls or
+            tickets tables, a saturated Postgres connection pool, or an N+1 in a
+            recently changed handler.
+          runbook_url: "https://github.com/aqlli-shahar/callcenter/blob/main/docs/runbooks/api-latency.md"
+
+      - alert: ApiLatencyP95Severe
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          service: callcenter-api
+          team: callcenter
+          slo: "api_latency_p95_200ms"
+        annotations:
+          summary: "API p95 latency {{ $value | humanizeDuration }} - 2.5x over SLO"
+          description: >-
+            Requests are taking over half a second at p95. Operators experience
+            this as a frozen dashboard during live calls. Treat as an outage.
+
+      - alert: ApiErrorRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[10m]))
+            /
+            clamp_min(sum(rate(http_requests_total[10m])), 0.001)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          service: callcenter-api
+          team: callcenter
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of API requests are 5xx"
+          description: >-
+            More than 5% of requests return a server error over 10 minutes.
+            Check the backend log for the dominant route and the error handler's
+            stack traces.
+
+      - alert: ApiRateLimitingHeavily
+        # 429s are healthy in small numbers (that is the login limiter working);
+        # a flood means either an attack or a client retry storm.
+        expr: |
+          sum(rate(http_requests_total{status="429"}[10m])) > 5
+        for: 10m
+        labels:
+          severity: info
+          service: callcenter-api
+          team: callcenter
+        annotations:
+          summary: "Sustained 429 responses ({{ $value | printf \"%.1f\" }}/s)"
+          description: >-
+            Clients are being rate limited continuously. Correlate with
+            nginx error.log limit_req entries and the fail2ban nginx jail before
+            widening any zone.
+
+  # ===========================================================================
+  # Capacity: disks, database growth, recordings. Slow-moving, high-consequence.
+  # ===========================================================================
+  - name: callcenter.capacity
+    interval: 1m
+    rules:
+      - alert: RecordingDiskFillingUp
+        # Recordings only ever grow. When the filesystem carrying them fills,
+        # MixMonitor fails silently AND Postgres stops committing - so this is
+        # the single most valuable capacity alert in the file.
+        #
+        # The matcher covers both layouts: recordings on the root filesystem
+        # (default) or on a dedicated volume. Narrow it to your real mountpoint
+        # if you add one.
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint=~"/|/var/lib/callcenter.*|/opt/callcenter.*"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint=~"/|/var/lib/callcenter.*|/opt/callcenter.*"}
+          ) < 0.15
+        for: 10m
+        labels:
+          severity: warning
+          service: host
+          team: callcenter
+        annotations:
+          summary: "Only {{ $value | humanizePercentage }} free on {{ $labels.mountpoint }}"
+          description: >-
+            Less than 15% free space where call recordings are written. Run
+            scripts/backup.sh to offload, then let its 90-day recording
+            retention prune, or grow the volume.
+
+      - alert: RecordingDiskCriticallyLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint=~"/|/var/lib/callcenter.*|/opt/callcenter.*"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint=~"/|/var/lib/callcenter.*|/opt/callcenter.*"}
+          ) < 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: host
+          team: callcenter
+        annotations:
+          summary: "{{ $labels.mountpoint }} is {{ $value | humanizePercentage }} free"
+          description: >-
+            Under 5% free. Recording writes and database commits are about to
+            fail. Free space now: delete the oldest files under the recordings
+            directory after confirming they are in the backup mirror.
+
+      - alert: DiskWillFillWithinSixHours
+        # Catches a runaway log or a stuck recording loop long before the static
+        # thresholds do. predict_linear over 6h of history, projected 6h ahead.
+        expr: |
+          predict_linear(
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint=~"/|/var/lib/callcenter.*|/opt/callcenter.*"}[6h],
+            6 * 3600
+          ) < 0
+        for: 30m
+        labels:
+          severity: warning
+          service: host
+          team: callcenter
+        annotations:
+          summary: "{{ $labels.mountpoint }} projected full within 6 hours"
+          description: >-
+            Current growth rate exhausts {{ $labels.mountpoint }} within 6
+            hours. Find the writer (`du -xh --max-depth=2 /` on the host) before
+            it becomes an outage.
+
+      - alert: HostMemoryPressure
+        # Asterisk drops RTP frames long before the kernel starts OOM-killing,
+        # so callers hear choppy audio while the host still looks "fine".
+        expr: |
+          (
+            node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+          ) < 0.10
+        for: 10m
+        labels:
+          severity: warning
+          service: host
+          team: callcenter
+        annotations:
+          summary: "Only {{ $value | humanizePercentage }} of RAM available"
+          description: >-
+            Memory pressure causes RTP jitter and dropped audio frames before it
+            causes an OOM kill. Check for a leaking backend process or an
+            oversized Postgres work_mem.
+
+      - alert: HostCpuSaturated
+        # 5-minute load average per core. Above 2.0 the media path starts to
+        # jitter on a shared VPS.
+        expr: |
+          node_load5 / count without (cpu, mode) (node_cpu_seconds_total{mode="idle"}) > 2
+        for: 15m
+        labels:
+          severity: warning
+          service: host
+          team: callcenter
+        annotations:
+          summary: "Load average {{ $value | printf \"%.2f\" }} per core"
+          description: >-
+            Sustained CPU saturation. Expect audio jitter and API latency
+            breaches. Identify the process with `docker stats`.
+
+      - alert: PostgresConnectionsNearLimit
+        expr: |
+          sum(pg_stat_activity_count) / max(pg_settings_max_connections) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          service: postgres
+          team: callcenter
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of Postgres connections in use"
+          description: >-
+            The connection pool is close to max_connections; new backend
+            requests will start failing with "too many clients". Look for idle
+            transactions (`pg_stat_activity where state='idle in transaction'`).
+
+      - alert: PostgresLongRunningTransaction
+        # A transaction open for 10+ minutes blocks VACUUM and can wedge
+        # migrations during a deploy.
+        expr: pg_stat_activity_max_tx_duration{state="active"} > 600
+        for: 5m
+        labels:
+          severity: warning
+          service: postgres
+          team: callcenter
+        annotations:
+          summary: "Transaction running for {{ $value | humanizeDuration }}"
+          description: >-
+            A long-lived transaction is blocking vacuum and may deadlock the
+            next migration. Identify and terminate it if it is stuck.

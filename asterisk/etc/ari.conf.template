@@ -1,0 +1,22 @@
+;=============================================================================
+; ari.conf - Asterisk REST Interface
+;
+; ARI rides on the HTTP server configured in http.conf. The backend uses:
+;   REST   http://<host>:8088/ari/...
+;   events ws://<host>:8088/ari/events?app=callcenter-ai
+;=============================================================================
+
+[general]
+enabled = yes
+; Pretty-printed JSON costs a little bandwidth but makes tcpdump/curl
+; debugging of a live call far easier.
+pretty = yes
+; The dashboard talks to ARI only through the backend, never from the
+; browser, so no browser origin needs allowing.
+allowed_origins =
+
+[${ASTERISK_ARI_USERNAME}]
+type = user
+read_only = no
+password = ${ASTERISK_ARI_PASSWORD}
+password_format = plain

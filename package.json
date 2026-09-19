@@ -1,0 +1,30 @@
+{
+  "name": "my-app",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --filter '*' dev",
+    "dev:backend": "bun --filter backend dev",
+    "dev:frontend": "bun --filter frontend dev",
+    "lint": "biome lint .",
+    "lint:fix": "biome lint --write .",
+    "format": "biome format .",
+    "format:fix": "biome format --write .",
+    "check": "biome check .",
+    "check:fix": "biome check --write .",
+    "prepare": "husky"
+  },
+  "workspaces": [
+    "apps/*",
+    "shared"
+  ],
+  "devDependencies": {
+    "@biomejs/biome": "2.3.11",
+    "@commitlint/cli": "^20.3.1",
+    "@commitlint/config-conventional": "^20.3.1",
+    "@types/bun": "latest",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7"
+  }
+}

@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: app-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-myapp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-myapp}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-myapp} -d ${POSTGRES_DB:-myapp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: app-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required} --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # Asterisk PBX - the AI voice layer's telephony engine (replaces FreePBX).
+  #
+  # On THIS machine Postgres and Redis run natively out of .localdev (see
+  # LOCAL_DEV.md), and their host ports are already taken, so bring up only
+  # this service:
+  #     docker compose up -d asterisk
+  # A clean Linux host can run `docker compose up -d` for the whole stack.
+  # ---------------------------------------------------------------------------
+  asterisk:
+    build:
+      context: .
+      dockerfile: docker/asterisk.Dockerfile
+    image: callcenter-asterisk:latest
+    container_name: callcenter-asterisk
+    # Asterisk puts its hostname into the From/Contact of every request it sends
+    # over the WebSocket transport. Docker's default hostname is the container id,
+    # which may start with a digit - an invalid SIP hostname that SIP.js refuses
+    # to parse, so the browser phone silently drops qualify pings and incoming
+    # INVITEs (AI -> operator transfers never ring). A fixed name avoids that.
+    hostname: asterisk
+    restart: unless-stopped
+    # Supplies the SIP/ARI/AMI credentials and voicemail PINs that
+    # asterisk/scripts/entrypoint.sh renders into the config templates.
+    env_file:
+      - .env
+    ports:
+      # SIP on 5070 rather than the customary 5060: MicroSIP already holds
+      # 5060/udp+tcp on this host. Asterisk binds 5070 INSIDE the container
+      # too (ASTERISK_SIP_PORT feeds pjsip.conf), so the port it advertises
+      # in Via/Contact matches the port callers actually reach it on.
+      - "${ASTERISK_SIP_PORT:-5070}:${ASTERISK_SIP_PORT:-5070}/udp"
+      - "${ASTERISK_SIP_PORT:-5070}:${ASTERISK_SIP_PORT:-5070}/tcp"
+      # ARI and AMI are bound to loopback: the backend is the only consumer,
+      # and neither should ever be reachable from the LAN.
+      - "127.0.0.1:8088:8088/tcp"
+      - "127.0.0.1:5038:5038/tcp"
+      # RTP host ports must EQUAL the container ports. Asterisk writes these
+      # exact numbers into its SDP, so a shifted mapping would send media to
+      # a port nothing is listening on. Range starts at 12000 because
+      # MicroSIP's own RTP already occupies 10010-10012.
+      - "${ASTERISK_RTP_START:-12000}-${ASTERISK_RTP_END:-12049}:${ASTERISK_RTP_START:-12000}-${ASTERISK_RTP_END:-12049}/udp"
+    extra_hosts:
+      # How Asterisk reaches the backend's AudioSocket listener on the host.
+      # Docker Desktop provides this name already; the explicit mapping keeps
+      # the file working on plain Linux Docker too.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # MixMonitor writes here, into a PER-TENANT subdirectory; the backend serves
+      # the same files through its existing uploads route, so recordings need no
+      # copy step. The tenant directory is the isolation boundary: the route that
+      # serves a recording is deliberately unauthenticated, because <audio> cannot
+      # send a header.
+      - ./apps/backend/uploads/call-recordings:/var/spool/asterisk/recordings
+      # The per-tenant endpoints, trunks and dialplan contexts. Written by the
+      # BACKEND from the tenants table and reloaded over AMI, which is what makes
+      # onboarding a customer need neither a rebuild nor a restart. The container
+      # writes a bootstrap copy from .env only when the file is missing.
+      - ./asterisk/etc/generated:/etc/asterisk/generated
+      - asterisk_log:/var/log/asterisk
+      - asterisk_voicemail:/var/spool/asterisk/voicemail
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  postgres_data:
+  redis_data:
+  asterisk_log:
+  asterisk_voicemail:

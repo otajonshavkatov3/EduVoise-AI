@@ -1,0 +1,164 @@
+# dependencies
+node_modules
+.pnp
+.pnp.js
+
+# build output
+out
+dist
+build
+*.tgz
+.next
+.nuxt
+.output
+
+# cache
+.cache
+*.tsbuildinfo
+.eslintcache
+.stylelintcache
+.prettiercache
+.biome
+*.cache
+.turbo
+.vercel
+.netlify
+
+# coverage
+coverage
+*.lcov
+.nyc_output
+
+# logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# environment variables
+.env
+.env.*
+!.env.example
+*.local
+
+# secrets & credentials
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.secret
+*.secrets
+secrets/
+credentials/
+.credentials
+*.credential
+service-account*.json
+*-credentials.json
+*-secret.json
+firebase-adminsdk*.json
+google-*.json
+aws-*.json
+
+# database
+*.sqlite
+*.sqlite3
+*.db
+*.sql.gz
+*.dump
+pgdata/
+mysql_data/
+mongo_data/
+redis_data/
+
+# docker
+docker-compose.override.yml
+.docker/
+
+# local dev services (portable postgres/redis binaries + data)
+.localdev/
+apps/backend/uploads/
+
+# backend-rendered Asterisk config (contains SIP passwords) - regenerated at runtime
+asterisk/etc/generated/*
+!asterisk/etc/generated/.gitkeep
+
+# IDE & editors
+.idea
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# runtime
+*.pid
+*.seed
+*.pid.lock
+
+# testing
+.jest
+jest.config.local.js
+playwright-report/
+test-results/
+
+# temporary
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# sensitive config files
+config.local.*
+settings.local.*
+*.local.json
+*.local.yaml
+*.local.yml
+*.local.toml
+
+# API keys & tokens (common patterns)
+*_rsa
+*_dsa
+*_ed25519
+*_ecdsa
+*.openssh
+id_rsa*
+id_dsa*
+known_hosts
+
+# cloud provider configs
+.aws/
+.azure/
+.gcp/
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+.terraform/
+
+# misc sensitive
+.htpasswd
+.htaccess
+*.bak
+*.old
+dump.rdb

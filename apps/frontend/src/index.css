@@ -1,0 +1,268 @@
+@layer tailwind-base, antd, tailwind-utilities;
+
+@import "tailwindcss/preflight.css" layer(tailwind-base);
+@import "tailwindcss/theme.css" layer(tailwind-base);
+@import "tailwindcss/utilities.css" layer(tailwind-utilities);
+
+:root {
+	/* Tailwind v4 theme tokens (shadcn-style) */
+	--color-background: 0 0% 100%;
+	--color-foreground: 240 10% 3.9%;
+	--color-card: 0 0% 100%;
+	--color-card-foreground: 240 10% 3.9%;
+	--color-popover: 0 0% 100%;
+	--color-popover-foreground: 240 10% 3.9%;
+	--color-primary: 221 83% 53%;
+	--color-primary-foreground: 0 0% 100%;
+	--color-secondary: 240 4.8% 95.9%;
+	--color-secondary-foreground: 240 5.9% 10%;
+	--color-muted: 240 4.8% 95.9%;
+	--color-muted-foreground: 240 3.8% 46.1%;
+	--color-accent: 240 4.8% 95.9%;
+	--color-accent-foreground: 240 5.9% 10%;
+	--color-destructive: 0 84.2% 60.2%;
+	--color-destructive-foreground: 0 0% 98%;
+	--color-border: 240 5.9% 90%;
+	--color-input: 240 5.9% 90%;
+	--color-ring: 221 83% 53%;
+	--radius: 0.6rem;
+
+	font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+	line-height: 1.5;
+	font-weight: 400;
+
+	font-synthesis: none;
+	text-rendering: optimizeLegibility;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+.dark {
+	--color-background: 240 10% 3.9%;
+	--color-foreground: 0 0% 98%;
+	--color-card: 240 10% 3.9%;
+	--color-card-foreground: 0 0% 98%;
+	--color-popover: 240 10% 3.9%;
+	--color-popover-foreground: 0 0% 98%;
+	--color-primary: 217 91% 60%;
+	--color-primary-foreground: 240 10% 3.9%;
+	--color-secondary: 240 3.7% 15.9%;
+	--color-secondary-foreground: 0 0% 98%;
+	--color-muted: 240 3.7% 15.9%;
+	--color-muted-foreground: 240 5% 64.9%;
+	--color-accent: 240 3.7% 15.9%;
+	--color-accent-foreground: 0 0% 98%;
+	--color-destructive: 0 62.8% 30.6%;
+	--color-destructive-foreground: 0 0% 98%;
+	--color-border: 240 3.7% 15.9%;
+	--color-input: 240 3.7% 15.9%;
+	--color-ring: 217 91% 60%;
+}
+body {
+	margin: 0;
+	min-width: 320px;
+	min-height: 100vh;
+}
+
+#root {
+	min-height: 100vh;
+}
+
+/* Modern Scrollbar */
+::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+::-webkit-scrollbar-thumb {
+	background: #cbd5e1;
+	border-radius: 20px;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: #94a3b8;
+}
+
+/* ---------------------------------------------------------------------------
+ * Sidebar
+ *
+ * The nav has 18 items (~48px each, plus the logo block and the logout
+ * button), which overflows a 100vh Sider on any normal laptop screen. Antd
+ * wraps children in .ant-layout-sider-children, so that element - not the
+ * Sider - has to become the full-height flex column, otherwise the menu
+ * cannot be given a scrollable region and the lower items are unreachable.
+ * --------------------------------------------------------------------------- */
+.app-sider .ant-layout-sider-children {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+
+.sidebar-scroll {
+	overflow-y: auto;
+	overflow-x: hidden;
+	/* Reserve the gutter so the menu does not shift sideways when the
+	 * scrollbar appears and disappears during collapse. */
+	scrollbar-gutter: stable;
+	/* Firefox */
+	scrollbar-width: thin;
+	scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+/* The global scrollbar thumb (#cbd5e1) is tuned for light content and is
+ * invisible against the dark sidebar gradient, so override it here. */
+.sidebar-scroll::-webkit-scrollbar {
+	width: 6px;
+}
+
+.sidebar-scroll::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+.sidebar-scroll::-webkit-scrollbar-thumb {
+	background: rgba(255, 255, 255, 0.15);
+	border-radius: 20px;
+}
+
+.sidebar-scroll::-webkit-scrollbar-thumb:hover {
+	background: rgba(255, 255, 255, 0.32);
+}
+
+/* Page Transitions */
+.animate-fadeIn {
+	animation: fadeIn 0.4s ease-out forwards;
+}
+
+@keyframes fadeIn {
+	from {
+		opacity: 0;
+		transform: translateY(10px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+/* Ant Design Menu Overrides */
+.custom-menu {
+	padding: 16px 12px;
+}
+
+.custom-menu .ant-menu-item {
+	height: 48px;
+	line-height: 48px;
+	border-radius: 12px;
+	margin-bottom: 8px;
+	width: 100%;
+	margin-inline: 0;
+	transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.custom-menu .ant-menu-item:hover {
+	background-color: rgba(255, 255, 255, 0.08);
+}
+
+.custom-menu .ant-menu-item-selected {
+	background-color: #2154b2;
+	box-shadow: 0 4px 12px rgba(33, 84, 178, 0.3);
+}
+
+.custom-menu .ant-menu-item .ant-menu-item-icon {
+	font-size: 18px;
+	margin-right: 12px;
+}
+
+/* Card Enhancements */
+.ant-card {
+	border-radius: 16px;
+	border: 1px solid #f1f5f9;
+	overflow: hidden;
+}
+
+.ant-card-head {
+	border-bottom: 1px solid #f1f5f9;
+	padding: 0 24px;
+	min-height: 64px;
+}
+
+.ant-card-head-title {
+	font-weight: 700;
+	color: #0f172a;
+}
+
+.ant-card-body {
+	padding: 24px;
+}
+
+/* Custom Segmented Tabs */
+.custom-segmented-tabs .ant-tabs-nav {
+	background: #f1f5f9;
+	padding: 4px;
+	border-radius: 12px;
+	display: inline-flex;
+	margin-bottom: 24px;
+}
+
+.custom-segmented-tabs .ant-tabs-nav::before {
+	display: none;
+}
+
+.custom-segmented-tabs .ant-tabs-tab {
+	margin: 0;
+	padding: 8px 24px;
+	border-radius: 8px;
+	transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.custom-segmented-tabs .ant-tabs-tab-active {
+	background: white;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.custom-segmented-tabs .ant-tabs-tab-active .ant-tabs-tab-btn {
+	color: #0f172a;
+	font-weight: 600;
+}
+
+.custom-segmented-tabs .ant-tabs-tab:not(.ant-tabs-tab-active) .ant-tabs-tab-btn {
+	color: #64748b;
+}
+
+.custom-segmented-tabs .ant-tabs-ink-bar {
+	display: none;
+}
+
+/* Custom Slider */
+.custom-slider .ant-slider-rail {
+	background-color: #f1f5f9;
+	height: 8px;
+}
+
+.custom-slider .ant-slider-track {
+	background-color: #0f172a;
+	height: 8px;
+}
+
+.custom-slider .ant-slider-handle::after {
+	width: 16px;
+	height: 16px;
+	background-color: #fff;
+	box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+	margin-top: -2px;
+}
+
+/* Custom Select */
+.custom-select .ant-select-selector {
+	border-radius: 12px;
+	height: 48px;
+	padding-top: 8px;
+	background-color: #f8fafc;
+	border-color: #e2e8f0;
+}
+
+.custom-select .ant-select-selection-item {
+	font-weight: 600;
+	color: #0f172a;
+}

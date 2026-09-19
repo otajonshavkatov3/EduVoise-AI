@@ -1,0 +1,450 @@
+# =============================================================================
+# docker-compose.prod.yml - PRODUCTION OVERLAY for CallCenter "Aqlli Shahar"
+#
+# Always used together with the base file, never alone:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# scripts/update.sh does exactly that (plus --env-file and --project-name
+# callcenter), so in practice you run scripts/update.sh.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS FILE ADDS
+#   backend, frontend, nginx, prometheus, grafana, node-exporter,
+#   postgres-exporter
+#
+# WHAT IT ONLY EXTENDS
+#   postgres, redis and asterisk keep the images, ports, commands and volumes
+#   defined in docker-compose.yml. Here they gain nothing but log rotation,
+#   resource limits, and - for Asterisk - a host-visible log directory that
+#   fail2ban can read.
+#
+# -----------------------------------------------------------------------------
+# COMPOSE MERGE SEMANTICS worth knowing before editing
+#   * mappings (environment, labels, logging.options) are merged key by key
+#   * ports / expose / dns are CONCATENATED - re-declaring a published port here
+#     would produce a duplicate binding, which is why none of them is repeated
+#   * volumes are unique by TARGET path: an entry with the same container path
+#     REPLACES the base one. That is used deliberately once, for
+#     /var/log/asterisk (see the comment there), and nowhere else.
+#
+# -----------------------------------------------------------------------------
+# IMAGE TAGS AND ROLLBACK
+#   backend and frontend are tagged ${IMAGE_TAG}, which scripts/update.sh sets to
+#   the git short SHA. Rolling back is `IMAGE_TAG=<old sha> docker compose up -d
+#   backend frontend nginx`, which is what update.sh --rollback does.
+#
+# -----------------------------------------------------------------------------
+# EXPOSURE MODEL
+#   Public:    nginx 80/443, asterisk 5070 + RTP 12000-12049 (base file)
+#   Loopback:  grafana 3002, prometheus 9090, node-exporter 9100,
+#              postgres-exporter 9187, ARI 8088, AMI 5038 (base file)
+#   Network-only (never published): backend 4000 + 9092, frontend 3001
+#
+#   Postgres (5434) and Redis (6380) are published on 0.0.0.0 by the BASE file.
+#   Published container ports bypass ufw, so config/firewall/ufw-rules.sh installs
+#   DOCKER-USER DROP rules for them. Run that script - it is not optional.
+# =============================================================================
+
+#------------------------------------------------------------------------------
+# Reusable fragments. json-file with a hard cap on every service: an unbounded
+# container log is the most common way a call-centre VPS runs out of disk, and a
+# full disk stops recordings AND Postgres commits.
+#------------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-prom-logging: &prom-logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "3"
+
+services:
+  # ===========================================================================
+  # EXISTING SERVICES - extended only.
+  # ===========================================================================
+  postgres:
+    logging: *default-logging
+    # Compose v2 applies deploy.resources.limits without swarm. The point is not
+    # to squeeze Postgres but to stop a runaway query from starving Asterisk,
+    # whose media path must never be CPU-starved (callers hear it immediately).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+        reservations:
+          memory: 256M
+    # The default 64MB /dev/shm is too small for parallel workers on the
+    # reporting queries (dashboard KPIs over the calls table).
+    shm_size: 256mb
+
+  redis:
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+        reservations:
+          memory: 64M
+    # NOTE: no `command:` override here on purpose. The base file's command sets
+    # requirepass + appendonly; replacing it to add maxmemory/eviction policy
+    # would let Redis evict session keys, which logs operators out mid-call.
+
+  asterisk:
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          # Two cores: transcoding plus MixMonitor on ~25 concurrent channels.
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    ulimits:
+      # Every channel costs several descriptors (SIP socket, 2 RTP sockets,
+      # MixMonitor file, AudioSocket). The default 1024 is reached surprisingly
+      # early and manifests as calls failing to set up under load.
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      # REPLACES the base file's `asterisk_log:/var/log/asterisk` named volume
+      # (volumes are unique by target). This is intentional and required:
+      # fail2ban runs on the HOST and tails /var/log/asterisk/security, which it
+      # cannot do inside a named volume. asterisk/etc/logger.conf already routes
+      # `security => security` into that directory.
+      - ${ASTERISK_LOG_DIR:-/var/log/asterisk}:/var/log/asterisk
+
+  # ===========================================================================
+  # NEW: application
+  # ===========================================================================
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    image: callcenter-backend:${IMAGE_TAG:-latest}
+    container_name: callcenter-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # These win over env_file. .env holds HOST-side URLs (localhost:5434 etc.)
+      # so that psql, drizzle-kit studio and backup.sh work from the host; the
+      # container has to use compose service names instead.
+      NODE_ENV: production
+      PORT: "4000"
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-callcenter}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-callcenter}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
+      # ARI/AMI over the private compose network. 8088 and 5038 are published to
+      # the host's loopback by the base file for debugging only - the backend
+      # never uses that path in production.
+      ASTERISK_ARI_URL: http://asterisk:8088/ari
+      ASTERISK_ARI_WS_URL: ws://asterisk:8088/ari/events
+      ASTERISK_AMI_HOST: asterisk
+      ASTERISK_AMI_PORT: "5038"
+      # AudioSocket: Asterisk dials OUT to the backend. Inside compose the
+      # reachable name is the service name - host.docker.internal is a Docker
+      # Desktop development crutch and does not exist on a Linux VPS.
+      AUDIOSOCKET_HOST: 0.0.0.0
+      AUDIOSOCKET_PORT: "9092"
+      AUDIOSOCKET_ADVERTISE_HOST: backend:9092
+      # Absolute path inside the container (the .env value is repo-relative).
+      RECORDINGS_DIR: /app/apps/backend/uploads/call-recordings
+      ASTERISK_RECORDINGS_DIR: /var/spool/asterisk/recordings
+    volumes:
+      # The SAME host directory Asterisk writes MixMonitor files into (base file
+      # mounts it at /var/spool/asterisk/recordings) and nginx serves read-only.
+      # One directory, three consumers, no copy step.
+      - ./apps/backend/uploads/call-recordings:/app/apps/backend/uploads/call-recordings
+    expose:
+      # Documentation for humans and for nginx; NOT published to the host.
+      - "4000"
+      - "9092"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      asterisk:
+        # service_started, not service_healthy: the backend retries its ARI
+        # connection with backoff, and blocking the API on the PBX would mean no
+        # dashboard at all during an Asterisk problem.
+        condition: service_started
+    healthcheck:
+      # Same probe as the image's HEALTHCHECK, restated here so `docker compose
+      # config` shows the contract that update.sh waits on.
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "const r = await fetch('http://127.0.0.1:4000/api/health'); process.exit(r.ok ? 0 : 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+      args:
+        # Baked into the bundle at build time. Same-origin (/) is correct because
+        # nginx serves the API under /api on the same host, which also keeps the
+        # CSP's connect-src 'self' sufficient.
+        VITE_API_URL: ${VITE_API_URL:-/}
+    image: callcenter-frontend:${IMAGE_TAG:-latest}
+    container_name: callcenter-frontend
+    restart: unless-stopped
+    expose:
+      - "3001"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3001/healthz"]
+      interval: 15s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
+  # ===========================================================================
+  # NEW: edge proxy
+  # ===========================================================================
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: callcenter-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # RENDERED vhosts (scripts/update.sh substitutes __DOMAIN__ from .env into
+      # nginx/conf.d.rendered/). The template directory itself is never mounted -
+      # __DOMAIN__ would resolve to a certificate path that does not exist.
+      - ./nginx/conf.d.rendered:/etc/nginx/conf.d:ro
+      # Certificates. deploy.sh puts a self-signed bootstrap pair here so nginx
+      # starts before certbot has ever run; certbot then overwrites it.
+      - ${LETSENCRYPT_DIR:-/etc/letsencrypt}:/etc/letsencrypt:ro
+      # ACME HTTP-01 webroot, shared with the certbot invocation on the host.
+      - ${CERTBOT_WEBROOT:-/var/www/certbot}:/var/www/certbot:ro
+      # Recordings, served ONLY through X-Accel-Redirect from an authenticated
+      # backend response (the /recordings/ location is `internal`). Read-only:
+      # nginx must never be able to alter or delete evidence.
+      - ./apps/backend/uploads/call-recordings:/var/www/recordings:ro
+      # Bind-mounted so the fail2ban nginx jails on the host can read them.
+      - ${NGINX_LOG_DIR:-/var/log/nginx}:/var/log/nginx
+    depends_on:
+      # service_started, NOT service_healthy: if the backend is unhealthy nginx
+      # must still come up to serve the dashboard shell and the styled 503 page.
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+    healthcheck:
+      # /nginx-health returns 200 from nginx itself without touching an upstream,
+      # so this reports the proxy's own state rather than the backend's.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 15s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 192M
+
+  # ===========================================================================
+  # NEW: monitoring
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: callcenter-prometheus
+    restart: unless-stopped
+    # No `user:` override: the image already runs as nobody(65534), and a fresh
+    # named volume inherits the ownership of /prometheus from the image. Forcing
+    # a uid here would break an existing volume that was created differently.
+    ports:
+      # Loopback only. Reach it with: ssh -L 9090:127.0.0.1:9090 root@host
+      - "127.0.0.1:9090:9090"
+    volumes:
+      # The whole directory: prometheus.yml, alerts.yml and secrets/.
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 30 days of history: enough to compare this month's call volume with last
+      # month's, and small enough to fit on a modest VPS.
+      - --storage.tsdb.retention.time=30d
+      # Hard ceiling as well as a time one, so a metric-cardinality accident
+      # cannot fill the disk and take Postgres down with it.
+      - --storage.tsdb.retention.size=4GB
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+      # Lets `curl -X POST http://127.0.0.1:9090/-/reload` apply an edited
+      # alerts.yml without dropping the in-memory series.
+      - --web.enable-lifecycle
+      - --web.external-url=http://127.0.0.1:9090
+    depends_on:
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *prom-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 768M
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: callcenter-grafana
+    restart: unless-stopped
+    ports:
+      # Loopback only: Grafana has its own login, but it is not hardened for the
+      # open internet and it can read every metric in the platform.
+      - "127.0.0.1:3002:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}
+      # Nobody self-registers on an internal monitoring instance.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://127.0.0.1:3002/}
+      # No phone-home from a government call centre's monitoring host.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Panels are provisioned from files; nobody needs to install plugins at
+      # runtime, and blocking it removes an egress path.
+      GF_INSTALL_PLUGINS: ""
+      GF_LOG_LEVEL: warn
+    depends_on:
+      prometheus:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *prom-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: callcenter-node-exporter
+    restart: unless-stopped
+    # pid: host so process and load metrics describe the HOST.
+    #
+    # Deliberately NOT `network_mode: host`: Prometheus lives on the compose
+    # bridge and resolves this service by name (node-exporter:9100). With host
+    # networking the exporter would only be reachable on the host's loopback,
+    # which the Prometheus container cannot see, and publishing 9100 on all
+    # interfaces is exactly what ufw-rules.sh forbids.
+    #
+    # Trade-off: /proc/net inside a container namespace shows the container's
+    # interfaces, so node_network_* is container-scoped. Every metric the alerts
+    # actually use - node_filesystem_*, node_memory_*, node_cpu_*, node_load* -
+    # is read through the bind-mounted /host/proc and /host/root and is
+    # host-accurate.
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      # rslave keeps later host mounts visible, which matters if a recordings
+      # volume is attached after the exporter started.
+      - /:/host/root:ro,rslave
+      # scripts/backup.sh writes callcenter_backup_*.prom here; this is what the
+      # BackupTooOld alert reads.
+      - ${TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}:/var/lib/node_exporter/textfile_collector:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      # Bridge-internal only: no host port is published for this service.
+      - --web.listen-address=0.0.0.0:9100
+      - --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+      # Container/virtual filesystems only add noise to the disk alerts.
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|var/lib/containerd/.+)($$|/)
+      - --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$$
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *prom-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: callcenter-postgres-exporter
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9187:9187"
+    environment:
+      # Talks to Postgres over the compose network. sslmode=disable is correct
+      # here: the traffic never leaves the docker bridge.
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-callcenter}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-callcenter}?sslmode=disable
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No healthcheck: this image has no shell and no wget, so any `test:` would
+    # fail permanently and mark a working exporter unhealthy. Prometheus's own
+    # `up{job="postgres-exporter"}` covers it, and MonitoringTargetDown alerts.
+    logging: *prom-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+# Top-level volumes are merged with the base file's (postgres_data, redis_data,
+# asterisk_log, asterisk_voicemail), so only the new ones are declared here.
+# asterisk_log stays declared in the base file but is no longer mounted by the
+# asterisk service in this overlay - Docker keeps it around, harmlessly, until
+# `docker volume rm callcenter_asterisk_log`.
+volumes:
+  prometheus_data:
+  grafana_data:
